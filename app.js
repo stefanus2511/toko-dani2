@@ -11,11 +11,36 @@ import {
   deleteDoc,
   runTransaction,
   serverTimestamp,
+  query,
+  where,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import {
   getAuth,
   signInAnonymously,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+// Import Modul PWA, IndexedDB & Sinkronisasi Offline
+import {
+  openOfflineDB,
+  saveOfflineTransaction,
+  getAllOfflineTransactions,
+  getPendingOfflineTransactions,
+  getPendingCount,
+  cacheProductsLocally,
+  getCachedProductsLocally,
+} from "./offline-db.js";
+import {
+  syncPendingTransactions,
+  requestBackgroundSync,
+  validateTransactionData,
+} from "./sync.js";
+import {
+  registerServiceWorker,
+  initPWAEvents,
+  promptInstallApp,
+  isRunningStandalone,
+  getOnlineStatus,
+} from "./pwa.js";
 
 // Firebase Configuration
 const firebaseConfig = {
@@ -152,6 +177,14 @@ const state = {
   scannerStream: null,
   scannerFrame: 0,
   scannerControls: null,
+  // PWA & Offline State
+  isOnline: navigator.onLine,
+  pendingOfflineCount: 0,
+  offlineTransactions: [],
+  canInstallPWA: false,
+  // Customer info for current cart
+  customerName: "Umum",
+  customerPhone: "",
   // Financial filters:
   periodMode: "today", // 'today' | 'custom'
   customSubmode: "single", // 'single' | 'range' | 'month'
@@ -180,45 +213,61 @@ function toast(message, icon = "check_circle") {
   }, 2200);
 }
 
-// Data synchronization with Firebase Firestore
+// Data synchronization with Firebase Firestore & IndexedDB Cache
 async function loadAll() {
   try {
-    if (!auth.currentUser) await signInAnonymously(auth);
-    const names = ["products", "transactions", "expenses", "stockMovements"];
-    const vals = await Promise.all(
-      names.map((n) => getDocs(collection(db, n))),
-    );
-    const [prodDocs, transDocs, expDocs, moveDocs] = vals;
+    state.isOnline = navigator.onLine;
 
-    state.products = prodDocs.docs.map((d) => ({ id: d.id, ...d.data() }));
-    state.transactions = transDocs.docs.map((d) => ({ id: d.id, ...d.data() }));
-    state.expenses = expDocs.docs.map((d) => ({ id: d.id, ...d.data() }));
-    state.stockMovements = moveDocs.docs.map((d) => ({
-      id: d.id,
-      ...d.data(),
-    }));
+    // 1. Coba koneksi & ambil data terbaru dari Firebase jika online
+    if (navigator.onLine) {
+      if (!auth.currentUser) await signInAnonymously(auth);
+      const names = ["products", "transactions", "expenses", "stockMovements"];
+      const vals = await Promise.all(
+        names.map((n) => getDocs(collection(db, n))),
+      );
+      const [prodDocs, transDocs, expDocs, moveDocs] = vals;
 
-    // Clean data state: no auto-seeding of demo products
-    const st = await getDoc(doc(db, "settings", "main"));
-    if (st.exists()) {
-      state.settings = { ...state.settings, ...st.data() };
-    }
+      state.products = prodDocs.docs.map((d) => ({ id: d.id, ...d.data() }));
+      state.transactions = transDocs.docs.map((d) => ({ id: d.id, ...d.data() }));
+      state.expenses = expDocs.docs.map((d) => ({ id: d.id, ...d.data() }));
+      state.stockMovements = moveDocs.docs.map((d) => ({
+        id: d.id,
+        ...d.data(),
+      }));
 
-    const dot = $("#connection-dot");
-    if (dot) {
-      dot.className =
-        "inline-block w-2.5 h-2.5 rounded-full bg-emerald-500 transition-colors";
-      dot.title = "Firestore Terhubung";
+      // Cache daftar produk ke IndexedDB untuk cadangan saat offline
+      if (state.products.length) {
+        await cacheProductsLocally(state.products);
+      }
+
+      const st = await getDoc(doc(db, "settings", "main"));
+      if (st.exists()) {
+        state.settings = { ...state.settings, ...st.data() };
+      }
+    } else {
+      // 2. Jika offline, muat produk dari cache IndexedDB
+      console.log('[App] Mode Offline: Memuat produk dari IndexedDB');
+      const cached = await getCachedProductsLocally();
+      if (cached && cached.length) {
+        state.products = cached;
+      }
     }
   } catch (err) {
     console.warn("Firestore connection notice:", err);
-    const dot = $("#connection-dot");
-    if (dot) {
-      dot.className =
-        "inline-block w-2.5 h-2.5 rounded-full bg-amber-400 transition-colors";
-      dot.title = "Mode Lokal / Offline";
+    // Fallback muat dari cache IndexedDB jika Firestore gagal
+    const cached = await getCachedProductsLocally();
+    if (cached && cached.length) {
+      state.products = cached;
     }
   } finally {
+    // Muat antrean transaksi offline dari IndexedDB
+    await updateOfflineTransactionsStatus();
+
+    // Jika online dan ada antrean transaksi, picu sinkronisasi otomatis
+    if (navigator.onLine && state.pendingOfflineCount > 0) {
+      setTimeout(() => window.sinkronkanSekarang(), 1500);
+    }
+
     updateTopBar();
     render();
   }
@@ -229,7 +278,21 @@ const totalStock = (p) => num(p.warehouse) + num(p.display);
 const isLowStock = (p) => totalStock(p) <= num(p.minStock) && totalStock(p) > 0;
 const isEmptyStock = (p) => totalStock(p) <= 0;
 
-// Update TopBar text & active bottom nav state
+// Helper untuk membaca antrean offline dari IndexedDB & mengupdate indikator UI
+async function updateOfflineTransactionsStatus() {
+  try {
+    state.isOnline = navigator.onLine;
+    const all = await getAllOfflineTransactions();
+    state.offlineTransactions = all;
+    state.pendingOfflineCount = all.filter(
+      (t) => t.syncStatus === "Menunggu dikirim" || t.syncStatus === "Gagal dikirim",
+    ).length;
+  } catch (err) {
+    console.warn("[App] Gagal membaca status antrean offline:", err);
+  }
+}
+
+// Update TopBar text & active bottom nav state & PWA network badge
 function updateTopBar() {
   const storeNameEl = $("#top-store-name");
   const dateLabelEl = $("#top-date-label");
@@ -246,6 +309,50 @@ function updateTopBar() {
     keuangan: "Keuangan & Laporan",
   };
   if (pageTitleEl) pageTitleEl.textContent = titles[state.page] || "Kasir";
+
+  // Update Status Jaringan & Indikator PWA di Header
+  const netBadge = $("#network-status-badge");
+  const netDot = $("#connection-dot");
+  const netText = $("#connection-text");
+  const pendingBadge = $("#offline-pending-badge");
+  const installBtn = $("#btn-install-pwa");
+
+  if (netBadge && netDot && netText) {
+    if (state.isOnline) {
+      netBadge.className =
+        "px-2 py-1 rounded-full text-[11px] font-bold flex items-center gap-1.5 bg-emerald-50 text-emerald-800 border border-emerald-200 transition-colors cursor-pointer shadow-2xs";
+      netBadge.title = "Status Jaringan: Online (Klik untuk lihat antrean)";
+      netDot.className = "inline-block w-2 h-2 rounded-full bg-emerald-500 transition-colors";
+      netText.textContent = "Online";
+    } else {
+      netBadge.className =
+        "px-2 py-1 rounded-full text-[11px] font-bold flex items-center gap-1.5 bg-amber-50 text-amber-900 border border-amber-300 transition-colors cursor-pointer shadow-2xs";
+      netBadge.title = "Status Jaringan: Offline (Transaksi disimpan ke perangkat)";
+      netDot.className = "inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse transition-colors";
+      netText.textContent = "Offline";
+    }
+  }
+
+  // Tampilkan badge jumlah antrean yang belum terkirim
+  if (pendingBadge) {
+    if (state.pendingOfflineCount > 0) {
+      pendingBadge.textContent = state.pendingOfflineCount;
+      pendingBadge.classList.remove("hidden");
+    } else {
+      pendingBadge.classList.add("hidden");
+    }
+  }
+
+  // Tampilkan tombol install PWA jika didukung browser
+  if (installBtn) {
+    if (state.canInstallPWA && !isRunningStandalone()) {
+      installBtn.classList.remove("hidden");
+      installBtn.classList.add("flex");
+    } else {
+      installBtn.classList.add("hidden");
+      installBtn.classList.remove("flex");
+    }
+  }
 
   $$("#bottom-nav .nav-tab-item").forEach((a) => {
     const active = a.dataset.path === state.page;
@@ -575,6 +682,14 @@ function renderKasir() {
               </div>
             </div>
 
+            <!-- Nama Pelanggan (Data Pelanggan) -->
+            <div class="input-box-wrapper flex items-center justify-between bg-surface-sand/70 px-2.5 rounded-lg h-8.5 border border-border-warm focus-within:border-primary/60 transition-colors">
+              <span class="text-[11.5px] text-on-surface-variant font-medium flex items-center gap-1">
+                <span class="material-symbols-outlined text-[14px] text-outline">person</span> Pelanggan
+              </span>
+              <input class="w-32 text-right bg-transparent text-[12px] font-semibold text-on-surface focus:outline-none border-0" id="pos-customer-name" type="text" placeholder="Nama / Umum" value="${esc(state.customerName || "Umum")}" oninput="window.setCustomerName(this.value)">
+            </div>
+
             <!-- Kembalian -->
             <div class="flex items-center justify-between px-2.5 py-1 rounded-lg bg-green-badge-bg/70 border border-primary/25">
               <div class="flex items-center gap-1 text-primary">
@@ -703,13 +818,18 @@ window.fokusNominal = () => {
   }
 };
 
+// Helper input nama pelanggan di kasir
+window.setCustomerName = (val) => {
+  state.customerName = val.trim() || "Umum";
+};
+
 // Input Uang Diterima: update value without dots
 window.setUangDiterima = (val) => {
   state.received = num(val);
   updateKasirCartInPlace();
 };
 
-// Proses Pembayaran Kasir
+// Proses Pembayaran Kasir (Online dengan Firebase & Offline dengan IndexedDB)
 window.prosesPembayaran = async () => {
   if (!state.cart.length)
     return toast("Keranjang belanja masih kosong!", "warning");
@@ -724,81 +844,159 @@ window.prosesPembayaran = async () => {
     );
   }
 
+  // Siapkan objek transaksi lengkap dengan ID unik, waktu pembuatan, detail produk, & data pelanggan
+  const number = `TD-${Date.now().toString().slice(-8)}`;
+  const change = received - grand;
+  const idempotencyKey = `idem-${number}-${Math.random().toString(36).slice(2, 8)}`;
+  const customerName = state.customerName || "Umum";
+  const customerPhone = state.customerPhone || "";
+
+  const transData = {
+    number,
+    idempotencyKey,
+    items: state.cart.map((i) => ({ ...i })),
+    subtotal,
+    discount,
+    total: grand,
+    costTotal: state.cart.reduce((acc, item) => {
+      const p = state.products.find((prod) => prod.id === item.id);
+      return acc + num(p?.buyPrice) * item.qty;
+    }, 0),
+    paymentMethod: "Tunai",
+    received,
+    change,
+    customerName,
+    customerPhone,
+    status: "selesai",
+    createdAt: new Date().toISOString(),
+  };
+
+  // Validasi data transaksi sebelum diproses
+  const validation = validateTransactionData(transData);
+  if (!validation.valid) {
+    return alert(`Validasi transaksi gagal: ${validation.error}`);
+  }
+
   state.busy = true;
   render();
 
-  try {
-    const number = `TD-${Date.now().toString().slice(-8)}`;
-    const change = received - grand;
-    const transData = {
-      number,
-      items: state.cart.map((i) => ({ ...i })),
-      subtotal,
-      discount,
-      total: grand,
-      costTotal: state.cart.reduce((acc, item) => {
-        const p = state.products.find((prod) => prod.id === item.id);
-        return acc + num(p?.buyPrice) * item.qty;
-      }, 0),
-      paymentMethod: "Tunai",
-      received,
-      change,
-      status: "selesai",
-      createdAt: serverTimestamp(),
-    };
+  // SKENARIO 1: JIKA PERANGKAT SEDANG ONLINE -> KIRIM LANGSUNG KE FIREBASE
+  if (navigator.onLine) {
+    try {
+      const transactionRef = doc(collection(db, "transactions"));
+      await runTransaction(db, async (tx) => {
+        const productRefs = state.cart.map((item) => doc(db, "products", item.id));
+        const snapshots = await Promise.all(productRefs.map((ref) => tx.get(ref)));
+        const nextStock = new Map();
 
-    const transactionRef = doc(collection(db, "transactions"));
-    await runTransaction(db, async (tx) => {
-      const productRefs = state.cart.map((item) => doc(db, "products", item.id));
-      const snapshots = await Promise.all(productRefs.map((ref) => tx.get(ref)));
-      const nextStock = new Map();
+        snapshots.forEach((snapshot, index) => {
+          const item = state.cart[index];
+          if (!snapshot.exists()) return; // skip item jika dibuat lokal
+          const product = snapshot.data();
+          const available = num(product.display) + num(product.warehouse);
+          if (available < item.qty) throw new Error(`Stok ${item.name} di server tidak mencukupi.`);
+          const display = num(product.display);
+          const fromDisplay = Math.min(display, item.qty);
+          nextStock.set(item.id, {
+            display: display - fromDisplay,
+            warehouse: num(product.warehouse) - (item.qty - fromDisplay),
+          });
+        });
 
-      snapshots.forEach((snapshot, index) => {
-        const item = state.cart[index];
-        if (!snapshot.exists()) throw new Error(`Barang ${item.name} tidak ditemukan.`);
-        const product = snapshot.data();
-        const available = num(product.display) + num(product.warehouse);
-        if (available < item.qty) throw new Error(`Stok ${item.name} tidak mencukupi.`);
-        const display = num(product.display);
-        const fromDisplay = Math.min(display, item.qty);
-        nextStock.set(item.id, {
-          display: display - fromDisplay,
-          warehouse: num(product.warehouse) - (item.qty - fromDisplay),
+        nextStock.forEach((stock, id) => {
+          tx.update(doc(db, "products", id), { ...stock, updatedAt: serverTimestamp() });
+        });
+        tx.set(transactionRef, {
+          ...transData,
+          createdAt: serverTimestamp(),
+          syncedAt: serverTimestamp(),
         });
       });
 
-      nextStock.forEach((stock, id) => {
-        tx.update(doc(db, "products", id), { ...stock, updatedAt: serverTimestamp() });
+      // Update stok lokal di memori
+      state.cart.forEach((item) => {
+        const p = state.products.find((prod) => prod.id === item.id);
+        if (!p) return;
+        const fromDisplay = Math.min(num(p.display), item.qty);
+        p.display = num(p.display) - fromDisplay;
+        p.warehouse = Math.max(0, num(p.warehouse) - (item.qty - fromDisplay));
       });
-      tx.set(transactionRef, transData);
+
+      // Simpan pembaruan stok ke IndexedDB
+      await cacheProductsLocally(state.products);
+
+      const completed = {
+        ...transData,
+        id: transactionRef.id,
+        createdAt: new Date(),
+        syncStatus: "Terkirim",
+      };
+
+      state.transactions.unshift(completed);
+      state.cart = [];
+      state.discount = 0;
+      state.received = 0;
+      state.customerName = "Umum";
+      state.customerPhone = "";
+      state.busy = false;
+
+      toast("Pembayaran berhasil & tersinkronkan!", "cloud_done");
+      render();
+      window.bukaNotaModal(completed);
+      return;
+    } catch (err) {
+      console.warn("[Pembayaran Online Gagal, Mengalihkan ke Mode Offline]:", err);
+      // Jika proses online gagal di tengah jalan, fallback simpan ke IndexedDB offline
+    }
+  }
+
+  // SKENARIO 2: JIKA OFFLINE ATAU KONEKSI FIREBASE TERPUTUS
+  try {
+    // Simpan ke IndexedDB dengan status "Menunggu dikirim"
+    const savedOffline = await saveOfflineTransaction({
+      ...transData,
+      id: `offline-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      createdAt: new Date().toISOString(),
     });
 
+    // Kurangi stok di memori lokal agar kasir tidak menjual barang habis
     state.cart.forEach((item) => {
       const p = state.products.find((prod) => prod.id === item.id);
       if (!p) return;
       const fromDisplay = Math.min(num(p.display), item.qty);
-      p.display = num(p.display) - fromDisplay;
+      p.display = Math.max(0, num(p.display) - fromDisplay);
       p.warehouse = Math.max(0, num(p.warehouse) - (item.qty - fromDisplay));
     });
 
+    // Simpan pembaruan stok ke IndexedDB
+    await cacheProductsLocally(state.products);
+
+    // Daftarkan Background Sync agar terkirim otomatis saat online
+    await requestBackgroundSync();
+
+    // Perbarui counter antrean offline
+    await updateOfflineTransactionsStatus();
+
     const completed = {
-      ...transData,
-      id: transactionRef.id,
+      ...savedOffline,
       createdAt: new Date(),
     };
+
     state.transactions.unshift(completed);
     state.cart = [];
     state.discount = 0;
     state.received = 0;
+    state.customerName = "Umum";
+    state.customerPhone = "";
     state.busy = false;
 
-    toast("Pembayaran berhasil!", "check_circle");
+    toast("Transaksi disimpan OFFLINE (Menunggu dikirim)", "cloud_off");
     render();
     window.bukaNotaModal(completed);
-  } catch (err) {
+  } catch (offlineErr) {
     state.busy = false;
     render();
-    alert("Gagal memproses pembayaran: " + err.message);
+    alert("Gagal menyimpan transaksi offline: " + offlineErr.message);
   }
 };
 
@@ -845,15 +1043,15 @@ function renderTambahBarang() {
         </div>
 
         <!-- Kode / Barcode -->
-        <div class="flex flex-col gap-1 bg-surface-cream rounded-xl p-3 shadow-xs border border-border-warm-subtle">
+        <div class="flex flex-col gap-1 bg-surface-cream rounded-xl p-3 shadow-xs border border-border-warm-subtle min-w-0 overflow-hidden">
           <label for="product-code" class="text-[12.5px] font-semibold text-text-primary-ink flex items-center justify-between">
             <span class="flex items-center gap-1">
               <span class="material-symbols-outlined text-primary text-[17px]">qr_code_scanner</span>
               <span>Kode / Barcode</span>
             </span>
           </label>
-          <div class="flex gap-1.5">
-            <input type="text" id="product-code" placeholder="Barcode / Kode unik" class="flex-1 h-10.5 px-3 rounded-lg bg-surface-sand border border-border-warm-subtle text-text-primary-ink font-mono text-[13px] focus:bg-surface-cream focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none transition-all placeholder:text-text-muted-ink/50">
+          <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar w-full py-0.5">
+            <input type="text" id="product-code" placeholder="Barcode / Kode unik" class="min-w-[130px] flex-1 h-10.5 px-3 rounded-lg bg-surface-sand border border-border-warm-subtle text-text-primary-ink font-mono text-[13px] focus:bg-surface-cream focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none transition-all placeholder:text-text-muted-ink/50 shrink-0 sm:shrink">
             <button type="button" onclick="window.generateAutoCode()" title="Kode Otomatis" class="h-10.5 px-2.5 rounded-lg bg-surface-sand hover:bg-surface-container-warm border border-border-warm-subtle text-text-primary-ink text-[12px] font-semibold flex items-center justify-center gap-1 active:scale-[0.98] transition-transform shrink-0 cursor-pointer">
               <span class="material-symbols-outlined text-[16px] text-primary">magic_button</span>
               <span>Otomatis</span>
@@ -1137,12 +1335,15 @@ function renderStokBarang() {
             </span>
           </div>
           <div class="flex items-center gap-1 shrink-0">
-            <button aria-label="Kurangi Stok" class="w-6.5 h-6.5 rounded-lg bg-surface-sand text-on-surface border border-border-warm-subtle font-medium flex items-center justify-center active:translate-y-0.5 transition-all" onclick="window.bukaModalKurangiStok('${p.id}')">
+            <button aria-label="Kurangi Stok" title="Kurangi Stok" class="w-6.5 h-6.5 rounded-lg bg-surface-sand hover:bg-surface-container text-on-surface border border-border-warm-subtle font-medium flex items-center justify-center active:translate-y-0.5 transition-all cursor-pointer" onclick="window.bukaModalKurangiStok('${p.id}')">
               <span class="material-symbols-outlined text-[15px]">remove</span>
             </button>
-            <button class="h-6.5 px-2 rounded-lg bg-primary text-on-primary text-[11px] font-semibold flex items-center justify-center gap-0.5 active:translate-y-0.5 transition-all" onclick="window.bukaModalRestock('${p.id}')">
+            <button title="Tambah Stok" class="h-6.5 px-2 rounded-lg bg-primary text-on-primary text-[11px] font-semibold flex items-center justify-center gap-0.5 active:translate-y-0.5 transition-all cursor-pointer" onclick="window.bukaModalRestock('${p.id}')">
               <span class="material-symbols-outlined text-[14px]">add</span>
               <span>Tambah</span>
+            </button>
+            <button aria-label="Hapus Barang" title="Hapus Barang Dari Toko" class="w-6.5 h-6.5 rounded-lg bg-surface-sand hover:bg-danger-soft-bg text-outline hover:text-danger-solid border border-border-warm-subtle flex items-center justify-center active:translate-y-0.5 transition-all cursor-pointer" onclick="window.konfirmasiHapusBarang('${p.id}')">
+              <span class="material-symbols-outlined text-[15px]">delete</span>
             </button>
           </div>
         </div>
@@ -1473,6 +1674,7 @@ window.eksekusiRestockCustom = () => {
 // ========================================================
 function renderKeuangan() {
   const { transactions: transList, expenses: expenseList } = activeReportData();
+  const allPeriodTransactions = state.transactions.filter((t) => isInActivePeriod(t.createdAt));
 
   const uangMasuk = transList.reduce((acc, t) => acc + num(t.total), 0);
   const totalModal = transList.reduce((acc, t) => acc + num(t.costTotal), 0);
@@ -1644,26 +1846,30 @@ function renderKeuangan() {
         <div class="keuangan-right-col lg:col-span-7 flex flex-col gap-2 mt-2.5 lg:mt-0">
           <div class="flex items-center justify-between px-0.5">
             <h3 class="text-[13.5px] text-text-primary-ink font-bold">Riwayat Transaksi Terakhir</h3>
-            <span class="text-[11.5px] text-text-muted-ink">${transList.length} transaksi</span>
+            <span class="text-[11.5px] text-text-muted-ink">${allPeriodTransactions.length} transaksi</span>
           </div>
           <div class="flex flex-col gap-1.5 max-h-[520px] overflow-y-auto no-scrollbar">
             ${
-              transList.length
-                ? transList
+              allPeriodTransactions.length
+                ? allPeriodTransactions
                     .slice(0, 15)
-                    .map(
-                      (t) => `
-              <div class="trans-item p-2.5 bg-surface-container-lowest border border-border-warm-subtle rounded-xl flex items-center justify-between shadow-xs hover:border-primary/50 transition-colors cursor-pointer" onclick="window.bukaNotaModal(${JSON.stringify(t).replace(/"/g, "&quot;")})">
+                    .map((t) => {
+                      const isBatal = t.status === "dibatalkan";
+                      return `
+              <div class="trans-item p-2.5 ${isBatal ? "bg-surface-sand/80 opacity-75" : "bg-surface-container-lowest"} border border-border-warm-subtle rounded-xl flex items-center justify-between shadow-xs hover:border-primary/50 transition-colors cursor-pointer" onclick="window.bukaNotaModal(${JSON.stringify(t).replace(/"/g, "&quot;")})">
                 <div class="flex flex-col min-w-0 pr-2">
-                  <span class="font-bold text-[12.5px] text-text-primary-ink">${esc(t.number)}</span>
+                  <div class="flex items-center gap-1.5">
+                    <span class="font-bold text-[12.5px] ${isBatal ? "text-text-muted-ink line-through" : "text-text-primary-ink"}">${esc(t.number)}</span>
+                    ${isBatal ? `<span class="px-1.5 py-0.2 rounded bg-danger-soft-bg text-danger-solid text-[9.5px] font-bold">Dibatalkan</span>` : ""}
+                  </div>
                   <span class="text-[11px] text-text-muted-ink">${dateFmt(t.createdAt)} · ${(t.items || []).length} item</span>
                 </div>
                 <div class="flex items-center gap-1.5 shrink-0">
-                  <span class="font-extrabold text-[13px] text-primary">${money(t.total)}</span>
+                  <span class="font-extrabold text-[13px] ${isBatal ? "text-text-muted-ink line-through" : "text-primary"}">${money(t.total)}</span>
                   <span class="material-symbols-outlined text-text-muted-ink text-[16px]">chevron_right</span>
                 </div>
-              </div>`,
-                    )
+              </div>`;
+                    })
                     .join("")
                 : `<div class="py-8 text-center text-text-muted-ink text-[12.5px]">Belum ada transaksi pada periode ini.</div>`
             }
@@ -2053,6 +2259,8 @@ window.bukaNotaModal = (t) => {
   const modalRoot = $("#modal-root");
   if (!modalRoot) return;
 
+  const isBatal = t.status === "dibatalkan";
+
   const itemsHtml = (t.items || [])
     .map(
       (i) => `
@@ -2068,13 +2276,29 @@ window.bukaNotaModal = (t) => {
     <div class="bg-surface-cream rounded-2xl p-3.5 flex flex-col gap-2.5 border border-border-warm shadow-2xl max-w-md mx-auto w-full">
       <div class="flex items-center justify-between pb-1 border-b border-border-warm-subtle">
         <div class="flex flex-col">
-          <span class="text-[14.5px] text-text-primary-ink font-bold">Nota #${esc(t.number || "000")}</span>
+          <div class="flex items-center gap-1.5">
+            <span class="text-[14.5px] text-text-primary-ink font-bold">Nota #${esc(t.number || "000")}</span>
+            ${
+              isBatal
+                ? `<span class="px-2 py-0.5 rounded-full bg-danger-soft-bg border border-danger-solid/30 text-danger-solid text-[10.5px] font-bold">Dibatalkan</span>`
+                : ""
+            }
+          </div>
           <span class="text-[11.5px] text-text-muted-ink">${esc(state.settings.storeName || "Toko Dani")} · Kasir</span>
         </div>
-        <button class="w-8 h-8 rounded-full bg-surface-sand border border-border-warm flex items-center justify-center text-text-primary-ink" onclick="window.tutupModalRoot()">
+        <button class="w-8 h-8 rounded-full bg-surface-sand border border-border-warm flex items-center justify-center text-text-primary-ink cursor-pointer" onclick="window.tutupModalRoot()">
           <span class="material-symbols-outlined text-[18px]">close</span>
         </button>
       </div>
+
+      ${
+        isBatal
+          ? `<div class="p-2.5 rounded-xl bg-danger-soft-bg border border-danger-solid/30 text-danger-solid flex items-center gap-2 text-[12px] font-semibold">
+              <span class="material-symbols-outlined text-[18px] shrink-0">cancel</span>
+              <span>Transaksi ini telah dibatalkan. Stok barang sudah dikembalikan ke toko.</span>
+            </div>`
+          : ""
+      }
 
       <div class="p-2.5 rounded-xl bg-surface-container-lowest border border-border-warm-subtle flex flex-col gap-1 text-[12.5px]">
         <div class="flex flex-col border-b border-border-warm-subtle/70 pb-1.5 mb-0.5">
@@ -2094,7 +2318,7 @@ window.bukaNotaModal = (t) => {
         }
         <div class="flex justify-between text-text-primary-ink text-[14.5px] font-extrabold pt-1 border-t border-border-warm-subtle">
           <span>Total Belanja:</span>
-          <span class="text-primary font-bold">${money(t.total)}</span>
+          <span class="${isBatal ? "text-text-muted-ink line-through" : "text-primary"} font-bold">${money(t.total)}</span>
         </div>
         <div class="flex justify-between text-text-muted-ink text-[12px]">
           <span>Bayar (Tunai):</span>
@@ -2110,17 +2334,147 @@ window.bukaNotaModal = (t) => {
         </div>
       </div>
 
-      <div class="flex gap-2">
-        <button class="flex-1 h-10 rounded-xl bg-surface-sand border border-border-warm text-text-primary-ink text-[12.5px] font-semibold" onclick="window.tutupModalRoot()">
-          Tutup
-        </button>
-        <button class="flex-1 h-10 rounded-xl bg-primary text-on-primary text-[12.5px] font-bold flex items-center justify-center gap-1 shadow-xs" onclick="window.cetakNotaThermal(${JSON.stringify(t).replace(/"/g, "&quot;")})">
-          <span class="material-symbols-outlined text-[17px]">print</span>
-          <span>Cetak Struk</span>
-        </button>
+      <div class="flex flex-col gap-1.5">
+        <div class="flex gap-2">
+          <button class="flex-1 h-11 rounded-xl bg-surface-sand hover:bg-surface-container-warm border border-border-warm text-text-primary-ink text-[13px] font-semibold transition-all cursor-pointer" onclick="window.tutupModalRoot()">
+            Tutup
+          </button>
+          <button class="flex-1 h-11 rounded-xl bg-primary hover:opacity-95 text-on-primary text-[13px] font-bold flex items-center justify-center gap-1.5 shadow-xs transition-all cursor-pointer" onclick="window.cetakNotaThermal(${JSON.stringify(t).replace(/"/g, "&quot;")})">
+            <span class="material-symbols-outlined text-[18px]">print</span>
+            <span>Cetak Struk</span>
+          </button>
+        </div>
+
+        ${
+          !isBatal
+            ? `<button type="button" class="w-full h-10.5 rounded-xl bg-danger-soft-bg hover:bg-danger-solid hover:text-white border border-danger-solid/30 text-danger-solid text-[12.5px] font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer active:scale-[0.99]" onclick="window.batalkanTransaksi('${esc(t.id || t.number)}')">
+                <span class="material-symbols-outlined text-[17px]">cancel</span>
+                <span>Batalkan Transaksi Ini</span>
+              </button>`
+            : ""
+        }
       </div>
     </div>
   </div>`;
+};
+
+// Fungsi Pembatalan Transaksi (Mengembalikan Stok ke Toko & Menghapus dari Omzet)
+window.batalkanTransaksi = async (targetIdOrNumber) => {
+  const trans = state.transactions.find(
+    (x) => x.id === targetIdOrNumber || x.number === targetIdOrNumber,
+  );
+  if (!trans) return alert("Data transaksi tidak ditemukan.");
+  if (trans.status === "dibatalkan") {
+    return alert("Transaksi ini sudah pernah dibatalkan sebelumnya.");
+  }
+
+  const konfirm = confirm(
+    `⚠️ KONFIRMASI PEMBATALAN TRANSAKSI\n\nNomor: #${trans.number}\nTotal Belanja: ${money(trans.total)}\nJumlah Barang: ${(trans.items || []).length} jenis barang\n\nApakah Ibu/Anda yakin ingin MEMBATALKAN transaksi ini?\n\n• Omzet penjualan akan otomatis dikurangi kembali\n• Seluruh stok barang yang dibeli akan DIKEMBALIKAN ke persediaan toko.`,
+  );
+  if (!konfirm) return;
+
+  state.busy = true;
+  render();
+
+  try {
+    // 1. Update status in Firestore & kembalikan stok barang
+    if (trans.id && !trans.id.startsWith("demo-")) {
+      await runTransaction(db, async (tx) => {
+        const transRef = doc(db, "transactions", trans.id);
+        const transSnap = await tx.get(transRef);
+        if (!transSnap.exists()) throw new Error("Transaksi tidak ditemukan di database.");
+
+        // Kembalikan setiap stok barang
+        for (const item of (trans.items || [])) {
+          if (!item.id || item.id.startsWith("demo-")) continue;
+          const prodRef = doc(db, "products", item.id);
+          const prodSnap = await tx.get(prodRef);
+          if (prodSnap.exists()) {
+            const currentProd = prodSnap.data();
+            const currentDisplay = num(currentProd.display);
+            tx.update(prodRef, {
+              display: currentDisplay + item.qty,
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+
+        // Catat mutasi stok pengembalian
+        const movementRef = doc(collection(db, "stockMovements"));
+        tx.set(movementRef, {
+          type: "Pembatalan Transaksi",
+          transactionNumber: trans.number,
+          note: `Pembatalan penjualan nota #${trans.number}`,
+          createdAt: serverTimestamp(),
+        });
+
+        // Tandai transaksi sebagai dibatalkan
+        tx.update(transRef, {
+          status: "dibatalkan",
+          cancelledAt: serverTimestamp(),
+        });
+      });
+    }
+
+    // 2. Update state lokal
+    trans.status = "dibatalkan";
+    (trans.items || []).forEach((item) => {
+      const p = state.products.find((prod) => prod.id === item.id);
+      if (p) {
+        p.display = num(p.display) + item.qty;
+      }
+    });
+
+    state.busy = false;
+    window.tutupModalRoot();
+    toast(`Transaksi #${trans.number} dibatalkan. Stok barang telah dikembalikan!`, "check_circle");
+    render();
+  } catch (err) {
+    state.busy = false;
+    render();
+    alert("Gagal membatalkan transaksi: " + err.message);
+  }
+};
+
+// Fungsi Konfirmasi Hapus Barang dari Toko (Dengan Verifikasi Kata "HAPUS")
+window.konfirmasiHapusBarang = async (id) => {
+  const p = state.products.find((prod) => prod.id === id);
+  if (!p) return;
+
+  const verifikasi = prompt(
+    `⚠️ KONFIRMASI HAPUS BARANG\n\nNama Barang: "${p.name}"\nSisa Stok: ${totalStock(p)} ${p.baseUnit || "pcs"}\nHarga Jual: ${money(p.sellPrice)}\n\nBarang ini akan dihapus permanen dari toko dan kasir.\nUntuk mencegah ketidaksengajaan, ketik kata "HAPUS" di bawah ini lalu tekan OK:`,
+  );
+
+  // Jika tombol Batal ditekan
+  if (verifikasi === null) return;
+
+  // Cek kata verifikasi
+  if (verifikasi.trim().toUpperCase() !== "HAPUS") {
+    return alert('Penghapusan dibatalkan. Anda harus mengetik kata "HAPUS" untuk menghapus barang.');
+  }
+
+  state.busy = true;
+  render();
+
+  try {
+    if (p.id && !p.id.startsWith("local-") && !p.id.startsWith("demo-")) {
+      await deleteDoc(doc(db, "products", p.id));
+    }
+
+    // Hapus dari state.products
+    state.products = state.products.filter((prod) => prod.id !== id);
+
+    // Hapus dari keranjang jika sedang dimasukkan
+    state.cart = state.cart.filter((item) => item.id !== id);
+
+    state.busy = false;
+    toast(`Barang "${p.name}" berhasil dihapus dari toko!`, "delete");
+    render();
+  } catch (err) {
+    state.busy = false;
+    render();
+    alert("Gagal menghapus barang: " + err.message);
+  }
 };
 
 window.tutupModalRoot = () => {
@@ -2532,7 +2886,188 @@ function render() {
   }
 }
 
-// Global Event Listeners for Bottom Navigation
+// ========================================================
+// PWA & OFFLINE SYNC HANDLERS & MODAL
+// ========================================================
+
+// Handler Instalasi Aplikasi PWA
+window.installAplikasiPWA = async () => {
+  const installed = await promptInstallApp();
+  if (installed) {
+    toast("Aplikasi Toko Dani berhasil di-install!", "download_done");
+  }
+};
+
+// Handler Sinkronkan Sekarang
+window.sinkronkanSekarang = async () => {
+  if (!navigator.onLine) {
+    return alert("Perangkat masih offline. Hubungkan ke Wi-Fi atau data seluler terlebih dahulu.");
+  }
+
+  const syncBtn = $("#btn-sync-modal");
+  if (syncBtn) {
+    syncBtn.disabled = true;
+    syncBtn.innerHTML = `<span class="material-symbols-outlined text-[17px] animate-spin">progress_activity</span><span>Menyinkronkan...</span>`;
+  }
+
+  toast("Menyinkronkan transaksi offline...", "sync");
+
+  try {
+    const result = await syncPendingTransactions({
+      db,
+      runTransaction,
+      doc,
+      collection,
+      setDoc,
+      getDocs,
+      query,
+      where,
+      serverTimestamp,
+      onProgress: (successCount, total) => {
+        toast(`Tersinkron: ${successCount}/${total}`, "sync");
+      },
+    });
+
+    await updateOfflineTransactionsStatus();
+    updateTopBar();
+
+    if (result.successCount > 0) {
+      toast(`✅ Berhasil menyinkronkan ${result.successCount} transaksi ke server!`, "cloud_done");
+      // Muat ulang data terbaru
+      await loadAll();
+    } else if (result.failCount > 0) {
+      toast(`Gagal mengirim ${result.failCount} transaksi. Akan dicoba lagi otomatis.`, "warning");
+    } else {
+      toast("Semua data transaksi sudah tersinkron rapi.", "check_circle");
+    }
+
+    // Refresh modal jika sedang terbuka
+    if ($("#modal-antrean-offline")) {
+      window.bukaModalAntreanOffline();
+    }
+  } catch (err) {
+    toast(`Sinkronisasi tertunda: ${err.message}`, "error");
+  } finally {
+    if (syncBtn) {
+      syncBtn.disabled = false;
+      syncBtn.innerHTML = `<span class="material-symbols-outlined text-[17px]">sync</span><span>Sinkronkan Sekarang</span>`;
+    }
+  }
+};
+
+// Modal Daftar Transaksi Offline / Antrean Sinkronisasi
+window.bukaModalAntreanOffline = async () => {
+  const modalRoot = $("#modal-root");
+  if (!modalRoot) return;
+
+  await updateOfflineTransactionsStatus();
+  const list = state.offlineTransactions || [];
+  const pending = list.filter((t) => t.syncStatus === "Menunggu dikirim" || t.syncStatus === "Gagal dikirim");
+
+  const rowsHtml = list.length
+    ? list
+        .map((t) => {
+          let badgeClass = "bg-amber-100 text-amber-800 border-amber-300";
+          let badgeIcon = "schedule";
+          if (t.syncStatus === "Terkirim") {
+            badgeClass = "bg-emerald-100 text-emerald-800 border-emerald-300";
+            badgeIcon = "check_circle";
+          } else if (t.syncStatus === "Gagal dikirim") {
+            badgeClass = "bg-red-100 text-red-800 border-red-300";
+            badgeIcon = "error";
+          }
+
+          return `
+          <div class="p-2.5 rounded-xl bg-surface-container-lowest border border-border-warm-subtle flex flex-col gap-1.5 shadow-2xs">
+            <div class="flex items-center justify-between">
+              <span class="font-bold text-[13px] text-text-primary-ink">#${esc(t.number)}</span>
+              <span class="px-2 py-0.5 rounded-full text-[10.5px] font-bold border flex items-center gap-1 ${badgeClass}">
+                <span class="material-symbols-outlined text-[13px]">${badgeIcon}</span>
+                <span>${esc(t.syncStatus || "Menunggu dikirim")}</span>
+              </span>
+            </div>
+            <div class="flex justify-between items-center text-[12px] text-text-muted-ink">
+              <span>${dateFmt(t.createdAt || t.savedOfflineAt)} · Pelanggan: <b>${esc(t.customerName || "Umum")}</b></span>
+              <span class="font-extrabold text-[13px] text-primary">${money(t.total)}</span>
+            </div>
+            <div class="text-[11.5px] text-text-muted-ink">
+              ${(t.items || []).map((it) => `${esc(it.name)} (${it.qty}x)`).join(", ")}
+            </div>
+            ${
+              t.lastError
+                ? `<div class="text-[11px] text-danger-solid bg-danger-soft-bg p-1.5 rounded-lg flex items-center gap-1 font-medium">
+                    <span class="material-symbols-outlined text-[14px]">warning</span>
+                    <span>${esc(t.lastError)}</span>
+                  </div>`
+                : ""
+            }
+          </div>`;
+        })
+        .join("")
+    : `<div class="py-10 text-center text-text-muted-ink flex flex-col items-center justify-center gap-1.5">
+        <span class="material-symbols-outlined text-[32px] text-text-muted-ink/50">cloud_done</span>
+        <span class="text-[13px] font-semibold">Tidak ada transaksi yang mengantre</span>
+        <span class="text-[11.5px]">Semua transaksi tersimpan rapi dan tersinkronkan.</span>
+      </div>`;
+
+  modalRoot.innerHTML = `
+  <div class="fixed inset-0 z-50 bg-inverse-surface/60 backdrop-blur-sm flex flex-col justify-end p-margin-mobile" id="modal-antrean-offline">
+    <div class="bg-surface-cream rounded-2xl p-4 flex flex-col gap-3 border border-border-warm shadow-2xl max-w-lg mx-auto w-full max-h-[85vh] overflow-y-auto">
+      <div class="flex items-center justify-between pb-1 border-b border-border-warm-subtle">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-lg ${state.isOnline ? "bg-emerald-500" : "bg-amber-500"} text-white flex items-center justify-center font-bold shadow-2xs">
+            <span class="material-symbols-outlined text-[19px]">${state.isOnline ? "wifi" : "wifi_off"}</span>
+          </div>
+          <div>
+            <h3 class="text-[14.5px] font-bold text-text-primary-ink">Status Koneksi & Antrean Transaksi</h3>
+            <p class="text-[11px] text-text-muted-ink">
+              Status: <b class="${state.isOnline ? "text-emerald-700" : "text-amber-700"}">${state.isOnline ? "Online (Terhubung Server)" : "Offline (Tersimpan Lokal)"}</b>
+            </p>
+          </div>
+        </div>
+        <button class="w-8 h-8 rounded-full bg-surface-sand border border-border-warm flex items-center justify-center text-text-primary-ink cursor-pointer" onclick="window.tutupModalRoot()">
+          <span class="material-symbols-outlined text-[18px]">close</span>
+        </button>
+      </div>
+
+      <!-- Ringkasan Info Antrean -->
+      <div class="p-3 rounded-xl ${pending.length ? "bg-amber-50 border border-amber-300 text-amber-900" : "bg-surface-sand border border-border-warm-subtle text-text-primary-ink"} text-[12px] flex items-center justify-between shadow-2xs">
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined text-[20px] ${pending.length ? "text-amber-700" : "text-primary"}">sync_alt</span>
+          <div>
+            <span class="font-bold">${pending.length} transaksi</span>
+            <span class="text-text-muted-ink"> belum disinkronkan ke server</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          id="btn-sync-modal"
+          onclick="window.sinkronkanSekarang()"
+          class="h-9 px-3 rounded-xl bg-primary hover:opacity-95 text-on-primary text-[12px] font-bold flex items-center gap-1.5 shadow-xs transition-all cursor-pointer ${
+            !state.isOnline || !pending.length ? "opacity-60 cursor-not-allowed" : ""
+          }"
+          ${!state.isOnline || !pending.length ? "disabled" : ""}
+        >
+          <span class="material-symbols-outlined text-[16px]">sync</span>
+          <span>Sinkronkan Sekarang</span>
+        </button>
+      </div>
+
+      <!-- Daftar Transaksi Offline di IndexedDB -->
+      <div class="flex flex-col gap-2 max-h-[380px] overflow-y-auto no-scrollbar">
+        ${rowsHtml}
+      </div>
+
+      <div class="pt-1 border-t border-border-warm-subtle flex justify-end">
+        <button class="w-full h-10 rounded-xl bg-surface-sand hover:bg-surface-container-warm border border-border-warm text-text-primary-ink text-[12.5px] font-semibold cursor-pointer" onclick="window.tutupModalRoot()">
+          Tutup
+        </button>
+      </div>
+    </div>
+  </div>`;
+};
+
+// Global Event Listeners for Bottom Navigation & PWA Initializer
 document.addEventListener("DOMContentLoaded", () => {
   $$("#bottom-nav .nav-tab-item").forEach((btn) => {
     btn.addEventListener("click", (e) => {
@@ -2540,6 +3075,34 @@ document.addEventListener("DOMContentLoaded", () => {
       const path = btn.dataset.path;
       if (path) window.pindahHalaman(path);
     });
+  });
+
+  // Daftarkan Service Worker
+  registerServiceWorker();
+
+  // Inisialisasi event PWA (Online/Offline/BeforeInstallPrompt)
+  initPWAEvents({
+    onConnectionChange: (online) => {
+      state.isOnline = online;
+      updateTopBar();
+      if (online) {
+        toast("Koneksi internet kembali ONLINE!", "cloud_done");
+        // Otomatis sinkronkan transaksi tertunda
+        window.sinkronkanSekarang();
+      } else {
+        toast("Aplikasi beralih ke mode OFFLINE. Transaksi tetap tersimpan aman.", "cloud_off");
+      }
+    },
+    onInstallableChange: (canInstall) => {
+      state.canInstallPWA = canInstall;
+      updateTopBar();
+    },
+  });
+
+  // Dengarkan sinyal sinkronisasi dari Service Worker (Background Sync)
+  window.addEventListener("app:trigger-sync", () => {
+    console.log("[App] Menerima sinyal sinkronisasi otomatis");
+    window.sinkronkanSekarang();
   });
 });
 

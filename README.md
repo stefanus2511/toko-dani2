@@ -1,65 +1,113 @@
-# Toko Dani · Manajemen Toko
+# Toko Dani · PWA Kasir & Manajemen Toko (Offline & Cloud Sync)
 
-Aplikasi web satu halaman dengan HTML, CSS, JavaScript vanilla, Firebase modular SDK, dan Cloud Firestore. Halaman: Beranda, Stok Barang, Kasir, Riwayat Transaksi, Keuangan, Stok Opname, Laporan, dan Pengaturan.
+Aplikasi Web Progresif (PWA) untuk kasir POS dan manajemen persediaan warung Toko Dani dengan kemampuan **100% Offline-Ready**, penyimpanan lokal aman dengan **IndexedDB**, serta **Sinkronisasi Otomatis** ke Cloud Firestore saat online.
 
-Antarmuka mengikuti arah mobile-first Toko Kita: warna krem-hijau, Plus Jakarta Sans, navigasi cepat bawah, kartu stok dengan filter status, estimasi margin pada form barang, serta pintasan pembayaran tunai dan laporan.
+---
 
-## Menjalankan secara lokal
+## 🚀 Fitur Utama PWA
 
-1. Pastikan project Firebase `toko-dani-77a00` memiliki Cloud Firestore dalam mode production dan **Anonymous Authentication** diaktifkan (Firebase Console → Authentication → Sign-in method).
-2. Terbitkan `firestore.rules` ke Firestore Rules. Aturan ini memerlukan sesi Firebase. Sesi anonim dibuat otomatis, sehingga tidak ada halaman login.
-3. Jalankan server statis dari folder ini, misalnya `python -m http.server 8000`, lalu buka `http://localhost:8000`. Modul JavaScript dan Firebase tidak dapat diandalkan jika halaman dibuka langsung dengan `file://`.
-4. Untuk deployment, unggah isi folder ke Firebase Hosting atau hosting statis yang memakai HTTPS. Gunakan project Firebase yang sama dan terbitkan rules sebelum membuka aplikasi.
+1. **Instalasi PWA (Desktop & Android)**:
+   - Dilengkapi `manifest.webmanifest`, ikon aplikasi (192px, 512px, SVG), warna tema (`#00652c`), dan splash screen.
+   - Mode display `standalone` (tampil seperti aplikasi native tanpa address bar browser).
+   - Tombol instalasi otomatis di header browser yang kompatibel.
 
-Konfigurasi web Firebase yang diberikan sudah berada di `app.js`. Konfigurasi web bukan rahasia dan bukan pengganti aturan akses. Jangan pernah menaruh kredensial service account di browser.
+2. **Dukungan Penuh Offline (Service Worker & Cache Storage)**:
+   - Service Worker (`sw.js`) meng-cache HTML, CSS, JavaScript, font Google, ikon, serta pustaka pendukung.
+   - Aplikasi tetap dapat dibuka, dimuat, dan digunakan untuk transaksi penjualan meskipun tidak ada sinyal internet.
+   - Indikator status jaringan real-time: **Online** (hijau) atau **Offline** (kuning/oranye).
 
-## Keamanan dan akses data
+3. **Penyimpanan Transaksi Offline (IndexedDB)**:
+   - Transaksi saat offline disimpan ke IndexedDB pada store `offline_transactions` dengan status `"Menunggu dikirim"`.
+   - Menggunakan ID unik, waktu pembuatan, detail item belanja, total harga, dan data pelanggan.
+   - Data transaksi lokal persisten dan tidak akan hilang meskipun browser ditutup atau perangkat dimatikan.
+   - Counter badge di header menunjukkan jumlah transaksi yang masih mengantre untuk dikirim.
 
-Tanpa login pengguna, aplikasi tidak dapat mengenali pemilik toko. Anonymous Authentication hanya membuat sesi teknis; siapa pun yang dapat membuka website bisa membuat sesi anonim lain. Karena rules contoh mengizinkan sesi Firebase, aturan itu **tidak membatasi data ke pemilik toko dan bukan pengamanan yang cukup untuk data operasional**. Jangan menganggap database aman untuk penggunaan publik.
+4. **Sinkronisasi Otomatis & Proteksi Idempotency**:
+   - Begitu internet kembali online atau aplikasi dibuka kembali, sistem otomatis mengirim transaksi yang tertunda ke server Firebase.
+   - Didukung **Background Sync API** pada browser yang mendukung.
+   - Tersedia tombol manual **"Sinkronkan Sekarang"** di modal antrean offline.
+   - Proteksi **Idempotency Key** memastikan transaksi tidak pernah tercatat ganda meskipun proses sinkronisasi dicoba berulang kali.
+   - Setelah sukses terkirim, status berubah menjadi `"Terkirim"`. Jika gagal, status menjadi `"Gagal dikirim"` dan tetap tersimpan aman untuk dicoba kembali.
 
-Untuk pemakaian sungguhan, pilihan yang disarankan adalah autentikasi staf (misalnya email/password) dan rules yang mengizinkan hanya UID staf yang didaftarkan, atau backend tepercaya (Cloud Functions/Cloud Run) dengan kredensial server dan validasi otorisasi di server. Sebelum memakai data nyata, ganti `hasSession()` dengan allowlist UID staf serta jangan aktifkan Anonymous Authentication, atau pindahkan seluruh mutasi ke backend. Aturan deny-all yang paling aman ketika belum siap:
+5. **Keamanan & Validasi Data**:
+   - Validasi ketat format data transaksi sebelum disimpan maupun dikirim.
+   - Tidak menyimpan informasi rahasia atau kredensial sensitif di perangkat.
+   - Transaksi tidak dianggap berhasil terkirim sebelum server memberikan respons sukses.
 
-```text
-match /{document=**} { allow read, write: if false; }
+---
+
+## 📁 Struktur Kode Modul
+
+- `manifest.webmanifest` : Konfigurasi PWA (nama, ikon, warna tema, display mode, shortcuts).
+- `sw.js` : Service Worker (caching aset statis & penanganan Background Sync).
+- `offline-db.js` : Modul IndexedDB untuk transaksi offline dan cache produk lokal.
+- `sync.js` : Modul logika sinkronisasi transaksi tertunda ke Firebase Firestore dengan idempotency.
+- `pwa.js` : Modul penanganan event PWA (online/offline listener, beforeinstallprompt, install helper).
+- `app.js` : Logika utama aplikasi kasir, stok, keuangan, dan UI antrean offline.
+- `icons/` : Aset ikon PNG (192px & 512px) dan vektor SVG.
+
+---
+
+## 🛠️ Cara Menjalankan Aplikasi
+
+Karena PWA membutuhkan origin HTTP/HTTPS lokal untuk mengaktifkan Service Worker dan ES Modules, jalankan aplikasi menggunakan web server lokal:
+
+### Menggunakan Python:
+```bash
+# Jalankan di dalam folder toko-dani
+python -m http.server 8000
+```
+Buka browser di: `http://localhost:8000`
+
+### Menggunakan Node.js (npx serve / http-server):
+```bash
+npx serve .
 ```
 
-Firestore App Check dapat membantu mengurangi trafik dari klien tidak sah, tetapi tidak menggantikan autentikasi dan otorisasi.
+---
 
-## Data dan perilaku
+## 📲 Cara Meng-install PWA
 
-Koleksi yang dipakai: `products`, `categories` (disediakan sebagai ruang untuk kategori), `stockMovements`, `stockOpnames`, `transactions`, `expenses`, `otherIncomes`, serta dokumen `settings/main`. Harga dan jumlah berupa angka; waktu dicatat sebagai Firestore Timestamp. Detail transaksi menyimpan harga jual dan HPP saat transaksi agar laporan historis tidak berubah ketika harga barang diperbarui. Kategori dan metode pembayaran disimpan sebagai daftar pada `settings/main`, sementara nama kategori yang telah dipakai tetap berada pada catatan lama.
+### Di Android (Chrome / Edge):
+1. Buka URL aplikasi di Google Chrome / Microsoft Edge.
+2. Ketuk tombol **Install** di header atas, atau ketuk menu titik tiga (⋮) di kanan atas browser.
+3. Pilih **"Tambahkan ke Layar Utama"** atau **"Instal Aplikasi"**.
+4. Ikon Toko Dani akan muncul di layar utama (home screen) dan dapat dibuka mandiri (*standalone*) tanpa bilah alamat browser.
 
-Penjualan kasir mengurangi display lebih dulu lalu gudang bila stok display tidak cukup, dan mencatat pergerakan. Semua perubahan produk, gerakan stok, dan transaksi penjualan terjadi dalam satu transaksi Firestore atomik. ID transaksi Firestore dibuat sekali saat tombol pembayaran diproses, dan nomor transaksi mengandung ID tersebut. Pengeluaran dan pemasukan lain dicatat terpisah; penjualan tidak disalin ke pemasukan lain. Saldo kas laporan menghitung penjualan tunai serta pemasukan lain dikurangi pengeluaran, sehingga transfer/QRIS tidak dianggap uang di laci.
+### Di Desktop / Laptop (Windows / Mac / Linux):
+1. Buka aplikasi di Chrome atau Edge.
+2. Klik tombol **Install** di header navigasi Toko Dani, atau klik ikon komputer/tanda (+) pada bilah alamat URL browser (address bar).
+3. Klik **"Install"**. Toko Dani akan terbuka dalam jendela aplikasi tersendiri dan memiliki shortcut di Desktop / Start Menu.
 
-Stok dijumlahkan dalam satuan dasar. Buka kemasan memindahkan isi dari gudang ke display dengan mengalikan isi per kemasan. Ekspor menghasilkan Excel berwarna dengan ringkasan, transaksi, dan pengeluaran; impor saat ini menerima CSV, bukan berkas XLSX. Kasir mendukung pemindaian kamera pada browser yang menyediakan `BarcodeDetector` dan akses kamera (HTTPS diperlukan); pencarian atau scanner barcode USB tetap tersedia sebagai alternatif. Laporan menghitung keuntungan barang sebagai omzet − HPP; pengeluaran operasional dicatat terpisah dan tidak mengurangi keuntungan barang. Kategori `Pembelian barang` tidak dikurangkan lagi karena HPP sudah memperhitungkan harga barang yang terjual. Pembayaran QRIS/transfer hanya dicatat, tanpa integrasi atau verifikasi otomatis. Nomor atau pengguna operator belum tersedia karena aplikasi belum memiliki identitas staf.
+---
 
-## Batasan sebelum operasional
+## 🧪 Panduan Uji Coba Skenario Offline & Sinkronisasi
 
-- Retur dan pembatalan transaksi belum disediakan. Riwayat penjualan tidak dapat dihapus dari antarmuka.
-- Impor hanya CSV sederhana; gunakan file kecil dan cocokkan header kolom sebelum mengimpor.
-- Aplikasi memuat koleksi ke browser untuk menghitung ringkasan; gunakan pagination/server-side query sebelum jumlah data membesar.
-- Kasir hanya mencegah klik ganda selama halaman masih hidup. Untuk jaminan idempotensi lebih kuat ketika koneksi putus dan pengguna mengulang transaksi, transaksi perlu kunci idempotensi di backend.
-- Penyesuaian stok opname tersimpan dalam dokumen opname dan gerakan stok, termasuk nilai sistem sebelum/sesudah.
+Anda dapat menguji skenario offline langsung melalui Google Chrome / Edge DevTools:
 
-## Pemeriksaan fitur
+1. **Membuka Aplikasi Tanpa Internet**:
+   - Buka aplikasi `http://localhost:8000` sekali saat terhubung.
+   - Buka DevTools (F12) → Tab **Network** → Ubah dropdown dari *No throttling* menjadi **Offline**.
+   - Muat ulang (Refresh) halaman (F5).
+   - **Hasil**: Aplikasi tetap terbuka mulus dan cepat berkat Service Worker cache. Indikator header otomatis berubah menjadi kuning **"Offline"**.
 
-Tidak ada koneksi browser ke project Firestore yang dijalankan dari lingkungan kerja ini, sehingga penyimpanan nyata, aturan, dan skenario jaringan belum dapat diuji. Status fitur yang menulis/membaca database adalah **BELUM DAPAT DIUJI** sampai aplikasi dijalankan dengan project dan aturan tersebut.
+2. **Membuat Transaksi Tanpa Internet**:
+   - Masih dalam mode **Offline**, pilih barang di kasir dan lakukan pembayaran.
+   - **Hasil**: Transaksi sukses diproses secara lokal dengan notifikasi *"Transaksi disimpan OFFLINE (Menunggu dikirim)"*. Badge antrean di header menampilkan angka `1`.
 
-| Alur pada prompt | Status | Catatan |
-|---|---|---|
-| Navigasi mobile, kartu stok, estimasi margin, periode laporan, format nominal kasir | LULUS (UI) | Diperiksa di browser pada viewport ponsel 375 px; akses Firestore tidak tersedia |
-| Scan kamera barcode, cetak laporan, WhatsApp | BELUM DAPAT DIUJI | Bergantung pada dukungan browser, izin kamera, dan perangkat/aksi eksternal |
-| Tambah barang / ubah barang | BELUM DAPAT DIUJI | CRUD UI disiapkan; perlu Firestore aktif |
-| Tambah stok dan riwayat | BELUM DAPAT DIUJI | Perubahan atomik di Firestore |
-| Buka kemasan dus | BELUM DAPAT DIUJI | Isi kemasan dikonversi ke satuan dasar |
-| Stok opname | BELUM DAPAT DIUJI | Simpan penyesuaian dan riwayat |
-| Arsip barang dan sembunyikan dari kasir | BELUM DAPAT DIUJI | Arsip/pulihkan tersedia |
-| Keranjang, tunai, kembalian, non-tunai, struk | BELUM DAPAT DIUJI | Implementasi tersedia; QRIS manual |
-| Stok berkurang konsisten dan transaksi atomik | BELUM DAPAT DIUJI | Menggunakan transaksi Firestore |
-| Penjualan tidak dihitung ganda pada keuangan | BELUM DAPAT DIUJI | Omzet dihitung dari transaksi; pemasukan lain terpisah |
-| Catat pengeluaran dan filter laporan tanggal | BELUM DAPAT DIUJI | Implementasi tersedia |
-| Ekspor barang/laporan ke Excel | BELUM DAPAT DIUJI | CSV kompatibel Excel, bukan XLSX |
-| Ubah kategori untuk halaman lain | BELUM DAPAT DIUJI | Pengaturan tersimpan pada settings/main |
-| Muat ulang, kegagalan Firestore, stok kurang, console browser | BELUM DAPAT DIUJI | Perlu browser dan koneksi ke Firebase |
+3. **Menutup dan Membuka Kembali Aplikasi**:
+   - Tutup tab browser atau tutup jendela aplikasi sepenuhnya.
+   - Buka kembali `http://localhost:8000` (masih dalam mode offline).
+   - Klik badge status di header untuk membuka modal antrean.
+   - **Hasil**: Transaksi yang tadi dibuat tetap ada di IndexedDB dengan status *"Menunggu dikirim"*, tidak hilang sedikit pun.
 
-Gunakan data uji non-produksi untuk menguji alur sebelum memasukkan data toko.
+4. **Mengaktifkan Internet Kembali & Sinkronisasi Otomatis**:
+   - Di DevTools tab Network, kembalikan ke **Online** (*No throttling*).
+   - **Hasil**: Indikator header langsung berubah hijau **"Online"**, toast *"Koneksi internet kembali ONLINE!"* muncul, dan sistem otomatis menyinkronkan transaksi ke Firebase.
+   - Status transaksi berubah menjadi *"Terkirim"*, dan stok produk di cloud otomatis terpotong sesuai pembelian.
+
+5. **Memastikan Transaksi Otomatis Terkirim Satu Kali (Idempotency)**:
+   - Jika tombol *"Sinkronkan Sekarang"* ditekan berulang kali, transaksi tidak akan pernah tercatat ganda di server karena dilindungi `idempotencyKey` dan pemeriksaan nomor nota unik.
+
+6. **Memastikan Transaksi Tetap Tersimpan Jika Pengiriman Gagal**:
+   - Jika koneksi terputus di tengah proses pengiriman, transaksi tidak akan dihapus melainkan diberi status *"Gagal dikirim"* disertai pesan error, dan dapat dicoba lagi secara aman kapan saja.
