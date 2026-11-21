@@ -167,6 +167,10 @@ export async function syncPendingTransactions(options = {}) {
                   const prodData = prodSnap.data();
                   const curDisplay = Number(prodData.display) || 0;
                   const curWarehouse = Number(prodData.warehouse) || 0;
+                  const available = curDisplay + curWarehouse;
+                  if (available < Number(item.qty)) {
+                    throw new Error(`Stok ${item.name} tidak cukup saat sinkronisasi. Tersedia ${available}, diminta ${item.qty}.`);
+                  }
                   const fromDisplay = Math.min(curDisplay, item.qty);
                   tx.update(prodRef, {
                     display: Math.max(0, curDisplay - fromDisplay),

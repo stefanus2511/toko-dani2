@@ -62,7 +62,10 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
 // Formatter Helpers
-const num = (n) => Number(n) || 0;
+const num = (n) => {
+  if (typeof n === "string") n = n.replace(/\./g, "").replace(",", ".").trim();
+  return Number(n) || 0;
+};
 const money = (n) =>
   new Intl.NumberFormat("id-ID", {
     style: "currency",
@@ -71,6 +74,10 @@ const money = (n) =>
   }).format(num(n));
 
 const rawNumber = (n) => String(num(n));
+const formatInputNumber = (value) => {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  return digits ? new Intl.NumberFormat("id-ID").format(Number(digits)) : "";
+};
 const esc = (s) =>
   String(s ?? "").replace(
     /[&<>"']/g,
@@ -644,7 +651,7 @@ function renderKasir() {
               </label>
               <div class="flex items-center gap-1">
                 <span class="font-bold text-[12px]">- Rp</span>
-                <input class="w-20 text-right bg-surface-sand border border-border-warm rounded-lg px-2 py-0.5 text-[12.5px] font-bold text-secondary focus:outline-none focus:border-secondary" id="pos-discount" type="number" min="0" placeholder="0" value="${state.discount ? num(state.discount) : ""}" oninput="window.setDiskon(this.value)">
+                <input class="w-20 text-right bg-surface-sand border border-border-warm rounded-lg px-2 py-0.5 text-[12.5px] font-bold text-secondary focus:outline-none focus:border-secondary" id="pos-discount" type="text" inputmode="numeric" data-money-input placeholder="0" value="${state.discount ? formatInputNumber(state.discount) : ""}" oninput="window.formatNominalInput(this); window.setDiskon(this.value)">
               </div>
             </div>
           </div>
@@ -678,7 +685,7 @@ function renderKasir() {
               </span>
               <div class="flex items-center gap-1 font-bold text-on-surface">
                 <span class="text-[12.5px] text-on-surface-variant">Rp</span>
-                <input class="w-24 text-right bg-transparent text-[14px] font-extrabold text-on-surface focus:outline-none border-0" id="uang-diterima" type="number" min="0" placeholder="0" value="${state.received ? num(state.received) : ""}" oninput="window.setUangDiterima(this.value)">
+                <input class="w-24 text-right bg-transparent text-[14px] font-extrabold text-on-surface focus:outline-none border-0" id="uang-diterima" type="text" inputmode="numeric" data-money-input placeholder="0" value="${state.received ? formatInputNumber(state.received) : ""}" oninput="window.formatNominalInput(this); window.setUangDiterima(this.value)">
               </div>
             </div>
 
@@ -829,10 +836,32 @@ window.setUangDiterima = (val) => {
   updateKasirCartInPlace();
 };
 
+window.formatNominalInput = (input) => {
+  const cursorFromEnd = input.value.length - (input.selectionStart || input.value.length);
+  input.value = formatInputNumber(input.value);
+  const pos = Math.max(0, input.value.length - cursorFromEnd);
+  input.setSelectionRange(pos, pos);
+};
+
 // Proses Pembayaran Kasir (Online dengan Firebase & Offline dengan IndexedDB)
 window.prosesPembayaran = async () => {
   if (!state.cart.length)
     return toast("Keranjang belanja masih kosong!", "warning");
+
+  // Validasi stok lokal lebih dulu agar barang habis tidak pernah dianggap sukses.
+  for (const item of state.cart) {
+    const product = state.products.find((p) => p.id === item.id);
+    if (!product) {
+      state.busy = false;
+      return alert(`Transaksi dibatalkan: data barang ${item.name} tidak ditemukan.`);
+    }
+    const available = totalStock(product);
+    if (available < num(item.qty)) {
+      state.busy = false;
+      return alert(`Transaksi dibatalkan: stok ${item.name} tidak cukup. Tersedia ${available}, diminta ${item.qty}.`);
+    }
+  }
+
   const subtotal = state.cart.reduce((a, x) => a + x.qty * x.price, 0);
   const discount = Math.min(subtotal, num(state.discount));
   const grand = Math.max(0, subtotal - discount);
@@ -891,10 +920,18 @@ window.prosesPembayaran = async () => {
 
         snapshots.forEach((snapshot, index) => {
           const item = state.cart[index];
-          if (!snapshot.exists()) return; // skip item jika dibuat lokal
+          if (!snapshot.exists()) {
+            const stockError = new Error(`Barang ${item.name} tidak ditemukan di server.`);
+            stockError.code = "INSUFFICIENT_STOCK";
+            throw stockError;
+          }
           const product = snapshot.data();
           const available = num(product.display) + num(product.warehouse);
-          if (available < item.qty) throw new Error(`Stok ${item.name} di server tidak mencukupi.`);
+          if (available < item.qty) {
+            const stockError = new Error(`Stok ${item.name} tidak cukup. Tersedia ${available}, diminta ${item.qty}.`);
+            stockError.code = "INSUFFICIENT_STOCK";
+            throw stockError;
+          }
           const display = num(product.display);
           const fromDisplay = Math.min(display, item.qty);
           nextStock.set(item.id, {
@@ -945,6 +982,11 @@ window.prosesPembayaran = async () => {
       window.bukaNotaModal(completed);
       return;
     } catch (err) {
+      if (err.code === "INSUFFICIENT_STOCK") {
+        state.busy = false;
+        render();
+        return alert(`Transaksi dibatalkan: ${err.message}`);
+      }
       console.warn("[Pembayaran Online Gagal, Mengalihkan ke Mode Offline]:", err);
       // Jika proses online gagal di tengah jalan, fallback simpan ke IndexedDB offline
     }
@@ -952,6 +994,14 @@ window.prosesPembayaran = async () => {
 
   // SKENARIO 2: JIKA OFFLINE ATAU KONEKSI FIREBASE TERPUTUS
   try {
+    for (const item of state.cart) {
+      const product = state.products.find((p) => p.id === item.id);
+      if (product && totalStock(product) < item.qty) {
+        state.busy = false;
+        render();
+        return alert(`Transaksi dibatalkan: stok ${item.name} tidak cukup. Tersedia ${totalStock(product)}.`);
+      }
+    }
     // Simpan ke IndexedDB dengan status "Menunggu dikirim"
     const savedOffline = await saveOfflineTransaction({
       ...transData,
@@ -1090,7 +1140,7 @@ function renderTambahBarang() {
             </label>
             <div class="relative flex items-center">
               <span class="absolute left-2.5 text-text-muted-ink text-[12px] select-none font-semibold">Rp</span>
-              <input type="number" id="cost-price" inputmode="numeric" min="0" step="100" value="4000" oninput="window.recalculateMargin()" class="w-full h-10.5 pl-9 pr-2 rounded-lg bg-surface-sand border border-border-warm-subtle text-text-primary-ink font-bold text-[13.5px] focus:bg-surface-cream focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none transition-all">
+              <input type="text" id="cost-price" inputmode="numeric" data-money-input value="4.000" oninput="window.formatNominalInput(this); window.recalculateMargin()" class="w-full h-10.5 pl-9 pr-2 rounded-lg bg-surface-sand border border-border-warm-subtle text-text-primary-ink font-bold text-[13.5px] focus:bg-surface-cream focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none transition-all">
             </div>
           </div>
           <div class="flex flex-col gap-1">
@@ -1100,7 +1150,7 @@ function renderTambahBarang() {
             </label>
             <div class="relative flex items-center">
               <span class="absolute left-2.5 text-primary text-[12px] select-none font-semibold">Rp</span>
-              <input type="number" id="sell-price" inputmode="numeric" min="0" step="100" value="5500" oninput="window.recalculateMargin()" class="w-full h-10.5 pl-9 pr-2 rounded-lg bg-surface-sand border border-border-warm-subtle text-primary font-bold text-[13.5px] focus:bg-surface-cream focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none transition-all">
+              <input type="text" id="sell-price" inputmode="numeric" data-money-input value="5.500" oninput="window.formatNominalInput(this); window.recalculateMargin()" class="w-full h-10.5 pl-9 pr-2 rounded-lg bg-surface-sand border border-border-warm-subtle text-primary font-bold text-[13.5px] focus:bg-surface-cream focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none transition-all">
             </div>
           </div>
         </div>
@@ -1281,6 +1331,51 @@ window.simpanBarangBaru = async () => {
   window.pindahHalaman("stok-barang");
 };
 
+window.editBarang = (id) => {
+  const product = state.products.find((p) => p.id === id);
+  if (!product) return alert("Barang tidak ditemukan.");
+  const modalRoot = $("#modal-root");
+  if (!modalRoot) return;
+  modalRoot.innerHTML = `
+    <div class="fixed inset-0 z-50 bg-inverse-surface/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4" id="edit-product-modal">
+      <div class="w-full sm:max-w-lg max-h-[90vh] overflow-y-auto bg-surface-cream rounded-t-2xl sm:rounded-2xl p-4 shadow-xl">
+        <div class="flex items-center justify-between mb-4">
+          <div><h3 class="text-[16px] font-bold text-text-primary-ink">Edit Data Barang</h3><p class="text-[11.5px] text-text-muted-ink">Perubahan stok tidak akan ikut berubah.</p></div>
+          <button type="button" class="w-8 h-8 rounded-full bg-surface-sand border border-border-warm flex items-center justify-center" onclick="window.tutupModalRoot()">×</button>
+        </div>
+        <form onsubmit="event.preventDefault(); window.simpanEditBarang('${esc(id)}');" class="flex flex-col gap-3">
+          <label class="text-[12px] font-semibold">Nama Barang<input id="edit-product-name" required value="${esc(product.name)}" class="mt-1 w-full h-10 px-3 rounded-lg bg-surface-sand border border-border-warm text-[13px]"></label>
+          <label class="text-[12px] font-semibold">Kode / Barcode<div class="mt-1 flex gap-1.5"><input id="edit-product-code" value="${esc(product.code || '')}" class="w-full h-10 px-3 rounded-lg bg-surface-sand border border-border-warm text-[13px] font-mono"><button type="button" onclick="window.startBarcodeScanner('edit-product-code')" class="h-10 px-3 rounded-lg bg-surface-sand border border-border-warm text-primary text-[12px] font-semibold flex items-center gap-1 shrink-0"><span class="material-symbols-outlined text-[16px]">barcode_scanner</span><span>Scan</span></button></div></label>
+          <label class="text-[12px] font-semibold">Kategori<select id="edit-product-category" class="mt-1 w-full h-10 px-3 rounded-lg bg-surface-sand border border-border-warm text-[13px]">${state.categories.map((c) => `<option value="${esc(c)}" ${c === (product.category || 'Lain-lain') ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="text-[12px] font-semibold">Harga Modal<input id="edit-buy-price" required value="${formatInputNumber(product.buyPrice)}" inputmode="numeric" oninput="window.formatNominalInput(this)" class="mt-1 w-full h-10 px-3 rounded-lg bg-surface-sand border border-border-warm text-[13px] font-bold"></label>
+            <label class="text-[12px] font-semibold">Harga Jual<input id="edit-sell-price" required value="${formatInputNumber(product.sellPrice)}" inputmode="numeric" oninput="window.formatNominalInput(this)" class="mt-1 w-full h-10 px-3 rounded-lg bg-surface-sand border border-border-warm text-[13px] font-bold"></label>
+          </div>
+          <div class="flex gap-2 pt-1"><button type="button" onclick="window.tutupModalRoot()" class="flex-1 h-10 rounded-xl bg-surface-sand border border-border-warm text-[13px] font-semibold">Batal</button><button type="submit" class="flex-1 h-10 rounded-xl bg-primary text-on-primary text-[13px] font-bold">Simpan Perubahan</button></div>
+        </form>
+      </div>
+    </div>`;
+};
+
+window.simpanEditBarang = async (id) => {
+  const product = state.products.find((p) => p.id === id);
+  if (!product) return;
+  const name = $("#edit-product-name")?.value || "";
+  const code = $("#edit-product-code")?.value || "";
+  const category = $("#edit-product-category")?.value || "Lain-lain";
+  const buyPrice = num($("#edit-buy-price")?.value);
+  const sellPrice = num($("#edit-sell-price")?.value);
+  const cleanName = name.trim(), cleanCode = code.trim();
+  if (!cleanName || buyPrice < 0 || sellPrice < 0) return alert("Data barang tidak valid.");
+  if (state.products.some((p) => p.id !== id && cleanCode && String(p.code || "").trim() === cleanCode)) return alert("Barcode tersebut sudah dipakai barang lain.");
+  const changes = { name: cleanName, code: cleanCode, category, buyPrice, sellPrice, updatedAt: serverTimestamp() };
+  try { if (!String(id).startsWith("local-")) await updateDoc(doc(db, "products", id), changes); }
+  catch (err) { console.warn("Update Firebase gagal, perubahan tetap disimpan lokal:", err); }
+  Object.assign(product, { ...changes, updatedAt: new Date() });
+  window.tutupModalRoot();
+  toast(`${cleanName} berhasil diperbarui!`); render();
+};
+
 // ========================================================
 // 3. HALAMAN STOK BARANG - MOBILE TUNED
 // ========================================================
@@ -1341,6 +1436,9 @@ function renderStokBarang() {
             <button title="Tambah Stok" class="h-6.5 px-2 rounded-lg bg-primary text-on-primary text-[11px] font-semibold flex items-center justify-center gap-0.5 active:translate-y-0.5 transition-all cursor-pointer" onclick="window.bukaModalRestock('${p.id}')">
               <span class="material-symbols-outlined text-[14px]">add</span>
               <span>Tambah</span>
+            </button>
+            <button aria-label="Edit Barang" title="Edit Barang" class="w-6.5 h-6.5 rounded-lg bg-surface-sand hover:bg-surface-container text-primary border border-border-warm-subtle flex items-center justify-center active:translate-y-0.5 transition-all cursor-pointer" onclick="window.editBarang('${p.id}')">
+              <span class="material-symbols-outlined text-[15px]">edit</span>
             </button>
             <button aria-label="Hapus Barang" title="Hapus Barang Dari Toko" class="w-6.5 h-6.5 rounded-lg bg-surface-sand hover:bg-danger-soft-bg text-outline hover:text-danger-solid border border-border-warm-subtle flex items-center justify-center active:translate-y-0.5 transition-all cursor-pointer" onclick="window.konfirmasiHapusBarang('${p.id}')">
               <span class="material-symbols-outlined text-[15px]">delete</span>
@@ -1793,7 +1891,7 @@ function renderKeuangan() {
                 <input class="flex-1 h-10 px-2.5 rounded-lg bg-surface-sand text-text-primary-ink border border-border-warm text-[13px] placeholder:text-text-muted-ink outline-none focus:border-tertiary-container focus:bg-surface-cream transition-colors min-w-0" id="nama-pengeluaran" placeholder="Keperluan (misal: Kresek)" required type="text">
                 <div class="relative flex items-center w-32 shrink-0">
                   <span class="absolute left-2 text-[12px] font-semibold text-text-muted-ink select-none">Rp</span>
-                  <input class="w-full h-10 pl-7 pr-2 rounded-lg bg-surface-sand text-text-primary-ink border border-border-warm text-[13px] font-bold placeholder:text-text-muted-ink outline-none focus:border-tertiary-container focus:bg-surface-cream transition-colors" id="nominal-pengeluaran" placeholder="0" required type="number" min="0">
+                  <input class="w-full h-10 pl-7 pr-2 rounded-lg bg-surface-sand text-text-primary-ink border border-border-warm text-[13px] font-bold placeholder:text-text-muted-ink outline-none focus:border-tertiary-container focus:bg-surface-cream transition-colors" id="nominal-pengeluaran" placeholder="0" required type="text" inputmode="numeric" data-money-input oninput="window.formatNominalInput(this)">
                 </div>
               </div>
               <button class="h-9 rounded-lg bg-tertiary-container hover:opacity-95 text-on-tertiary text-[12.5px] font-bold flex items-center justify-center gap-1 shadow-xs active:translate-y-0.5 transition-all cursor-pointer" type="submit">
